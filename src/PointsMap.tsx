@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
+import CircularProgress from '@mui/material/CircularProgress'
 import { MapContainer, Pane, Rectangle, TileLayer, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import type { GeographicRegionBounds, MapView, Strategy, ViewportBounds } from './decimate'
@@ -353,6 +354,8 @@ type Props = {
   boxSelectActive?: boolean
   committedBoxBounds?: ViewportBounds | null
   onBoxSelectionComplete?: (bounds: GeographicRegionBounds) => void
+  /** True while parent is applying a new sampling strategy (show map overlay). */
+  strategySwitching?: boolean
 }
 
 function DisplacementLegend() {
@@ -460,6 +463,7 @@ export default function PointsMap({
   boxSelectActive = false,
   committedBoxBounds = null,
   onBoxSelectionComplete,
+  strategySwitching = false,
 }: Props) {
   return (
     <div className="points-map-host">
@@ -522,6 +526,23 @@ export default function PointsMap({
             debugSignFilter={debugSignFilter}
           />
         </MapContainer>
+        {strategySwitching ? (
+          <div
+            className="map-strategy-loading"
+            role="status"
+            aria-live="polite"
+            aria-label="Updating map sampling"
+          >
+            <CircularProgress
+              size={40}
+              thickness={3.6}
+              sx={{
+                color: 'rgba(232, 190, 210, 0.95)',
+              }}
+            />
+            <span className="map-strategy-loading__text">Updating sampling…</span>
+          </div>
+        ) : null}
         <div className="map-vignette" aria-hidden />
         <MapChrome
           mapZoom={mapZoom}

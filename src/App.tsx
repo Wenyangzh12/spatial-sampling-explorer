@@ -11,6 +11,7 @@ import CssBaseline from '@mui/material/CssBaseline'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Slider from '@mui/material/Slider'
+import Typography from '@mui/material/Typography'
 import {
   decimate,
   DEFAULT_RETENTION_RATIO,
@@ -29,6 +30,9 @@ import {
   type Point,
 } from './mockData'
 import PointsMap from './PointsMap'
+import ComputationTimeDialog, {
+  type ComputationTimeRow,
+} from './ComputationTimeDialog'
 import DisplacementTrendDialog, {
   type DisplacementStrategySeries,
 } from './DisplacementTrendDialog'
@@ -184,12 +188,58 @@ const strategies: {
   },
 ]
 
+const INITIAL_STRATEGY: Strategy = 'random'
+
 export default function App() {
   const points = useMemo(() => generateMockPoints(), [])
-  const [strategy, setStrategy] = useState<Strategy>('random')
+  /** Shown in UI immediately when the user picks from the list. */
+  const [uiStrategy, setUiStrategy] = useState<Strategy>(INITIAL_STRATEGY)
+  /** Drives decimate() / map points — updates after a paint so loading state can show first. */
+  const [appliedStrategy, setAppliedStrategy] =
+    useState<Strategy>(INITIAL_STRATEGY)
+  const [strategySwitching, setStrategySwitching] = useState(false)
+  const applyRafRef = useRef(0)
+  const applyTimeoutRef = useRef(0)
+  const pendingApplyRef = useRef<Strategy | null>(null)
+
+  /**
+   * Apply decimation on the next frame after paint so loading UI (progress + overlay)
+   * is visible before synchronous heavy work blocks the main thread.
+   */
+  const scheduleStrategyApply = useCallback((next: Strategy) => {
+    cancelAnimationFrame(applyRafRef.current)
+    window.clearTimeout(applyTimeoutRef.current)
+    pendingApplyRef.current = next
+    setUiStrategy(next)
+    setStrategySwitching(true)
+    applyRafRef.current = requestAnimationFrame(() => {
+      applyTimeoutRef.current = window.setTimeout(() => {
+        applyRafRef.current = 0
+        applyTimeoutRef.current = 0
+        const target = pendingApplyRef.current
+        if (target == null) return
+        setAppliedStrategy(target)
+        queueMicrotask(() => {
+          if (pendingApplyRef.current === target) {
+            setStrategySwitching(false)
+          }
+        })
+      }, 0)
+    })
+  }, [])
+
+  useEffect(
+    () => () => {
+      cancelAnimationFrame(applyRafRef.current)
+      window.clearTimeout(applyTimeoutRef.current)
+    },
+    [],
+  )
+
   const [mapView, setMapView] = useState<MapView | null>(null)
   const [map, setMap] = useState<LeafletMap | null>(null)
   const [displacementTrendOpen, setDisplacementTrendOpen] = useState(false)
+  const [computationTimeOpen, setComputationTimeOpen] = useState(false)
   const [selectedRegionBounds, setSelectedRegionBounds] =
     useState<GeographicRegionBounds | null>(null)
   const [boxSelectMode, setBoxSelectMode] = useState(false)
@@ -199,9 +249,9 @@ export default function App() {
   const [visitedEpoch, setVisitedEpoch] = useState(0)
 
   useLayoutEffect(() => {
-    visitedStrategiesRef.current.add(strategy)
+    visitedStrategiesRef.current.add(uiStrategy)
     setVisitedEpoch((e) => e + 1)
-  }, [strategy])
+  }, [uiStrategy])
 
   const decimateOpts = useMemo(
     () => ({ retentionRatio }),
@@ -264,8 +314,8 @@ export default function App() {
   )
 
   const activeDecimated = useMemo(
-    () => getDecimated(strategy),
-    [getDecimated, strategy],
+    () => getDecimated(appliedStrategy),
+    [getDecimated, appliedStrategy],
   )
 
   const visiblePoints = activeDecimated.points
@@ -307,6 +357,39 @@ export default function App() {
     visitedEpoch,
   ])
 
+  const computationRows: ComputationTimeRow[] = useMemo(() => {
+    if (!computationTimeOpen || viewId === '') return []
+    const visited = visitedStrategiesRef.current
+    const list: {
+      strategy: Strategy
+      label: string
+      ms: number
+      pointsOut: number
+    }[] = []
+    for (const s of strategies) {
+      if (!visited.has(s.value)) continue
+      const { points, ms } = getDecimated(s.value)
+      list.push({
+        strategy: s.value,
+        label: s.label,
+        ms,
+        pointsOut: points.length,
+      })
+    }
+    list.sort((a, b) => a.ms - b.ms)
+    const baseline = baselineMsForPeers(list.map((x) => x.ms))
+    return list.map((r, i) => ({
+      strategy: r.strategy,
+      label: r.label,
+      ms: r.ms,
+      pointsOut: r.pointsOut,
+      rank: i + 1,
+      relativeLabel: formatRelativeMultiplier(r.ms, baseline),
+      isFastest: i === 0,
+      isCurrent: r.strategy === uiStrategy,
+    }))
+  }, [computationTimeOpen, viewId, getDecimated, visitedEpoch, uiStrategy])
+
   const allStrategyComputeMs = useMemo(() => {
     const p = decimateCacheRef.current.partial
     const visited = visitedStrategiesRef.current
@@ -317,13 +400,13 @@ export default function App() {
       if (ent) ms.push(ent.ms)
     }
     if (ms.length === 0) {
-      const cur = p[strategy]
+      const cur = p[appliedStrategy]
       if (cur) ms.push(cur.ms)
     }
     return ms
   }, [
     getDecimated,
-    strategy,
+    appliedStrategy,
     activeDecimated,
     displacementSeries,
     visitedEpoch,
@@ -347,7 +430,7 @@ export default function App() {
     displayedPointsInSelectedRegion,
   } = useMemo(() => {
     const viewportBounds = mapView?.bounds ?? null
-    const shown = getDecimated(strategy).points
+    const shown = getDecimated(appliedStrategy).points
     const nearLine = (p: (typeof points)[number]) =>
       isLineStructuralPoint(p.lat, p.lng)
 
@@ -372,7 +455,7 @@ export default function App() {
     filtered,
     getDecimated,
     mapView,
-    strategy,
+    appliedStrategy,
     selectedRegionBounds,
   ])
 
@@ -389,14 +472,15 @@ export default function App() {
   useEffect(() => {
     if (!displacementRegionReady) {
       setDisplacementTrendOpen(false)
+      setComputationTimeOpen(false)
     }
   }, [displacementRegionReady])
 
   const fmt = (n: number) => n.toLocaleString('en-US')
 
-  const meta = strategies.find((s) => s.value === strategy)!
+  const meta = strategies.find((s) => s.value === uiStrategy)!
 
-  const usesRetentionBudget = strategy !== 'original'
+  const usesRetentionBudget = uiStrategy !== 'original'
 
   const retentionPercentLabel = `${(retentionRatio * 100).toFixed(1)}%`
 
@@ -422,8 +506,11 @@ export default function App() {
             <select
               id="strategy"
               className="panel-select"
-              value={strategy}
-              onChange={(e) => setStrategy(e.target.value as Strategy)}
+              value={uiStrategy}
+              aria-busy={strategySwitching}
+              onChange={(e) =>
+                scheduleStrategyApply(e.target.value as Strategy)
+              }
             >
               {strategies.map((s) => (
                 <option key={s.value} value={s.value}>
@@ -432,6 +519,22 @@ export default function App() {
               ))}
             </select>
             <p className="panel-card__desc">{meta.blurb}</p>
+            {strategySwitching ? (
+              <Typography
+                variant="caption"
+                component="p"
+                sx={{
+                  mt: 0.75,
+                  mb: 0,
+                  fontSize: '0.7rem',
+                  fontWeight: 600,
+                  color: 'rgba(214, 180, 200, 0.95)',
+                }}
+                aria-live="polite"
+              >
+                Updating sampling…
+              </Typography>
+            ) : null}
           </section>
 
           {usesRetentionBudget && (
@@ -460,13 +563,20 @@ export default function App() {
             </section>
           )}
 
-          <section className="panel-card" aria-labelledby="panel-summary-h">
+          <section
+            className="panel-card"
+            aria-labelledby="panel-summary-h"
+            style={{
+              opacity: strategySwitching ? 0.5 : 1,
+              transition: 'opacity 0.15s ease',
+            }}
+          >
             <h2 id="panel-summary-h" className="panel-card__heading">
               Summary
             </h2>
             <div className="panel-metric">
               <div className="panel-metric__value tabular">
-                {fmt(visiblePoints.length)}
+                {strategySwitching ? '—' : fmt(visiblePoints.length)}
               </div>
               <div className="panel-metric__label">Displayed points</div>
               <div className="panel-metric__sub tabular">
@@ -481,7 +591,9 @@ export default function App() {
               </div>
             </div>
             <div className="panel-line-metric" aria-live="polite">
-              {linePointsBefore > 0 && lineRetentionPct !== null ? (
+              {strategySwitching ? (
+                <span className="panel-line-metric__empty">Updating…</span>
+              ) : linePointsBefore > 0 && lineRetentionPct !== null ? (
                 <>
                   <div className="panel-line-metric__label">
                     Line structure retained
@@ -501,7 +613,7 @@ export default function App() {
             </div>
             <div
               className={
-                currentStrategySlowHint
+                !strategySwitching && currentStrategySlowHint
                   ? 'panel-compute panel-compute--slower'
                   : 'panel-compute'
               }
@@ -510,12 +622,18 @@ export default function App() {
               <div className="panel-compute__label">Computation time</div>
               <div className="panel-compute__row">
                 <span className="panel-compute__value tabular">
-                  {formatComputeMs(currentComputeMs)}{' '}
-                  <span className="panel-compute__rel tabular">
-                    ({currentRelativeLabel})
-                  </span>
+                  {strategySwitching ? (
+                    '—'
+                  ) : (
+                    <>
+                      {formatComputeMs(currentComputeMs)}{' '}
+                      <span className="panel-compute__rel tabular">
+                        ({currentRelativeLabel})
+                      </span>
+                    </>
+                  )}
                 </span>
-                {currentStrategySlowHint ? (
+                {!strategySwitching && currentStrategySlowHint ? (
                   <span className="panel-compute__hint">slower vs fastest</span>
                 ) : null}
               </div>
@@ -572,6 +690,28 @@ export default function App() {
               >
                 View displacement trend
               </Button>
+              <Button
+                variant="contained"
+                color="inherit"
+                size="medium"
+                fullWidth
+                disableElevation
+                className="panel-action-btn panel-action-btn--compute"
+                disabled={!displacementRegionReady}
+                title={
+                  displacementRegionReady
+                    ? undefined
+                    : selectedRegionBounds != null &&
+                        displayedPointsInSelectedRegion === 0
+                      ? 'No points in the selected region for this strategy'
+                      : 'Map bounds and at least one point in view are required'
+                }
+                onClick={() => {
+                  if (displacementRegionReady) setComputationTimeOpen(true)
+                }}
+              >
+                View computation time
+              </Button>
             </div>
             {selectedRegionBounds != null ? (
               <p className="panel-region-pill" aria-live="polite">
@@ -589,7 +729,7 @@ export default function App() {
             <div className="map-viewport">
               <PointsMap
                 points={visiblePoints}
-                strategy={strategy}
+                strategy={appliedStrategy}
                 onMapViewChange={onMapViewChange}
                 onMapReady={setMap}
                 mapZoom={zoom}
@@ -597,10 +737,11 @@ export default function App() {
                 retainedPoints={visiblePoints.length}
                 viewportPoints={filtered.length}
                 retentionPercentLabel={retentionPercentLabel}
-                retentionApplies={strategy !== 'original'}
+                retentionApplies={appliedStrategy !== 'original'}
                 boxSelectActive={boxSelectMode}
                 committedBoxBounds={selectedRegionBounds}
                 onBoxSelectionComplete={handleRegionSelectComplete}
+                strategySwitching={strategySwitching}
               />
             </div>
           </div>
@@ -614,9 +755,17 @@ export default function App() {
             onClose={() => setDisplacementTrendOpen(false)}
             regionBounds={boundsForDisplacementTrend}
             series={displacementSeries}
-            selectedStrategy={strategy}
+            selectedStrategy={uiStrategy}
           />
         ) : null}
+
+        <ComputationTimeDialog
+          open={computationTimeOpen}
+          onClose={() => setComputationTimeOpen(false)}
+          rows={computationRows}
+          viewportPoints={filtered.length}
+          retentionLabel={retentionPercentLabel}
+        />
       </div>
     </ThemeProvider>
   )
