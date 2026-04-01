@@ -605,7 +605,8 @@ export default function DisplacementTrendDialog({
               flexShrink: 0,
             }}
           >
-            Times are decimate() sampling cost for the map viewport and retention (not trend
+            Only strategies you have chosen in the sidebar appear here (each is decimated on
+            demand). Times are decimate() cost for the map viewport and retention (not trend
             simulation). Multipliers use the fastest series in this list as 1×.
           </Typography>
         </Box>

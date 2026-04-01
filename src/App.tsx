@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { ThemeProvider, createTheme } from '@mui/material/styles'
 import CssBaseline from '@mui/material/CssBaseline'
 import Box from '@mui/material/Box'
@@ -187,6 +194,14 @@ export default function App() {
     useState<GeographicRegionBounds | null>(null)
   const [boxSelectMode, setBoxSelectMode] = useState(false)
   const [retentionRatio, setRetentionRatio] = useState(DEFAULT_RETENTION_RATIO)
+  /** Strategies the user has chosen at least once — only these appear in the trend modal. */
+  const visitedStrategiesRef = useRef<Set<Strategy>>(new Set())
+  const [visitedEpoch, setVisitedEpoch] = useState(0)
+
+  useLayoutEffect(() => {
+    visitedStrategiesRef.current.add(strategy)
+    setVisitedEpoch((e) => e + 1)
+  }, [strategy])
 
   const decimateOpts = useMemo(
     () => ({ retentionRatio }),
@@ -220,37 +235,101 @@ export default function App() {
 
   const decimateCacheRef = useRef<{
     key: string
-    result: Record<Strategy, { points: Point[]; ms: number }>
-  } | null>(null)
+    partial: Partial<Record<Strategy, { points: Point[]; ms: number }>>
+  }>({ key: '', partial: {} })
 
-  /**
-   * All strategies timed together (decimate only — not React render).
-   * Cached per viewport + retention + input size so identical inputs reuse results
-   * and timings stay stable (less flicker).
-   */
-  const decimatedByStrategy = useMemo(() => {
-    const cacheKey = `${viewId}|${filtered.length}|${map ? 1 : 0}`
-    const hit = decimateCacheRef.current
-    if (hit?.key === cacheKey) return hit.result
-
-    const out = {} as Record<Strategy, { points: Point[]; ms: number }>
-    for (const { value } of strategies) {
-      const t0 = performance.now()
-      const pts = decimate(filtered, value, zoom, map, decimateOpts)
-      out[value] = { points: pts, ms: performance.now() - t0 }
-    }
-    decimateCacheRef.current = { key: cacheKey, result: out }
-    return out
-  }, [filtered, zoom, map, decimateOpts, viewId])
-
-  const visiblePoints = decimatedByStrategy[strategy].points
-
-  const allStrategyComputeMs = useMemo(
-    () => strategies.map((s) => decimatedByStrategy[s.value].ms),
-    [decimatedByStrategy],
+  const computeContextKey = useMemo(
+    () => `${viewId}|${filtered.length}|${map ? 1 : 0}`,
+    [viewId, filtered.length, map],
   )
 
-  const currentComputeMs = decimatedByStrategy[strategy].ms
+  /** Decimate only when a strategy is selected or needed for an open modal. */
+  const getDecimated = useCallback(
+    (s: Strategy): { points: Point[]; ms: number } => {
+      const store = decimateCacheRef.current
+      if (store.key !== computeContextKey) {
+        store.key = computeContextKey
+        store.partial = {}
+      }
+      const hit = store.partial[s]
+      if (hit) return hit
+      const t0 = performance.now()
+      const pts = decimate(filtered, s, zoom, map, decimateOpts)
+      const ms = performance.now() - t0
+      const ent = { points: pts, ms }
+      store.partial[s] = ent
+      return ent
+    },
+    [computeContextKey, decimateOpts, filtered, map, zoom],
+  )
+
+  const activeDecimated = useMemo(
+    () => getDecimated(strategy),
+    [getDecimated, strategy],
+  )
+
+  const visiblePoints = activeDecimated.points
+
+  const boundsForDisplacementTrend =
+    selectedRegionBounds ?? mapView?.bounds ?? null
+
+  const displacementSeries: DisplacementStrategySeries[] = useMemo(() => {
+    if (
+      !displacementTrendOpen ||
+      !boundsForDisplacementTrend ||
+      viewId === ''
+    ) {
+      return []
+    }
+    const visited = visitedStrategiesRef.current
+    const order = strategies.map((s) => s.value)
+    const out: DisplacementStrategySeries[] = []
+    for (const s of order) {
+      if (!visited.has(s)) continue
+      const { points: pts, ms } = getDecimated(s)
+      const n = pointsInViewport(pts, boundsForDisplacementTrend).length
+      if (n === 0) continue
+      const region = regionSelectionFromViewport(boundsForDisplacementTrend, n)
+      out.push({
+        strategy: s,
+        label: strategies.find((x) => x.value === s)?.label ?? s,
+        selectedPointCount: n,
+        monthly: simulateRegionDisplacementTrend(region, s),
+        computeMs: ms,
+      })
+    }
+    return out
+  }, [
+    displacementTrendOpen,
+    boundsForDisplacementTrend,
+    viewId,
+    getDecimated,
+    visitedEpoch,
+  ])
+
+  const allStrategyComputeMs = useMemo(() => {
+    const p = decimateCacheRef.current.partial
+    const visited = visitedStrategiesRef.current
+    const ms: number[] = []
+    for (const { value } of strategies) {
+      if (!visited.has(value)) continue
+      const ent = p[value]
+      if (ent) ms.push(ent.ms)
+    }
+    if (ms.length === 0) {
+      const cur = p[strategy]
+      if (cur) ms.push(cur.ms)
+    }
+    return ms
+  }, [
+    getDecimated,
+    strategy,
+    activeDecimated,
+    displacementSeries,
+    visitedEpoch,
+  ])
+
+  const currentComputeMs = activeDecimated.ms
   const fastestStrategyMs = baselineMsForPeers(allStrategyComputeMs)
   const currentRelativeLabel = formatRelativeMultiplier(
     currentComputeMs,
@@ -261,29 +340,6 @@ export default function App() {
     allStrategyComputeMs,
   )
 
-  const boundsForDisplacementTrend =
-    selectedRegionBounds ?? mapView?.bounds ?? null
-
-  const displacementSeries: DisplacementStrategySeries[] = useMemo(() => {
-    if (!boundsForDisplacementTrend || viewId === '') return []
-    const order = strategies.map((s) => s.value)
-    const out: DisplacementStrategySeries[] = []
-    for (const s of order) {
-      const pts = decimatedByStrategy[s].points
-      const n = pointsInViewport(pts, boundsForDisplacementTrend).length
-      if (n === 0) continue
-      const region = regionSelectionFromViewport(boundsForDisplacementTrend, n)
-      out.push({
-        strategy: s,
-        label: strategies.find((x) => x.value === s)?.label ?? s,
-        selectedPointCount: n,
-        monthly: simulateRegionDisplacementTrend(region, s),
-        computeMs: decimatedByStrategy[s].ms,
-      })
-    }
-    return out
-  }, [decimatedByStrategy, viewId, boundsForDisplacementTrend])
-
   const {
     linePointsBefore,
     linePointsAfter,
@@ -291,8 +347,7 @@ export default function App() {
     displayedPointsInSelectedRegion,
   } = useMemo(() => {
     const viewportBounds = mapView?.bounds ?? null
-    const full = decimatedByStrategy.original.points
-    const shown = decimatedByStrategy[strategy].points
+    const shown = getDecimated(strategy).points
     const nearLine = (p: (typeof points)[number]) =>
       isLineStructuralPoint(p.lat, p.lng)
 
@@ -308,14 +363,14 @@ export default function App() {
         : filtered.length > 0)
 
     return {
-      linePointsBefore: full.filter(nearLine).length,
+      linePointsBefore: filtered.filter(nearLine).length,
       linePointsAfter: shown.filter(nearLine).length,
       displacementRegionReady,
       displayedPointsInSelectedRegion,
     }
   }, [
-    decimatedByStrategy,
     filtered,
+    getDecimated,
     mapView,
     strategy,
     selectedRegionBounds,
@@ -465,8 +520,9 @@ export default function App() {
                 ) : null}
               </div>
               <p className="panel-compute__sub">
-                Sampling (decimate) for the map viewport and retention. Relative to
-                fastest strategy in this view ({formatComputeMs(fastestStrategyMs)}).
+                Sampling runs only for the strategy you select. Trend chart includes
+                strategies you have chosen in this session. Relative to fastest among
+                those ({formatComputeMs(fastestStrategyMs)}).
                 {selectedRegionBounds != null
                   ? ' Region box affects the trend chart, not this timing.'
                   : ''}
