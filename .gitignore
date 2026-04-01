@@ -1,0 +1,8 @@
+node_modules
+dist
+build
+.vite
+.vercel
+.DS_Store
+.env
+.env.local
